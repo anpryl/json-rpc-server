@@ -23,6 +23,7 @@ import Data.Maybe (catMaybes)
 import Data.Text (Text, append, unpack)
 import qualified Data.Aeson as A
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
+import Data.Aeson.Types (iparse, IResult (..), formatError)
 
 import qualified Data.Vector as V
 import qualified Data.Aeson.Key as AK
@@ -74,9 +75,9 @@ instance (A.FromJSON a, MethodParams f p m r) => MethodParams (a -> f) (a :+: p)
         name = paramName param
 
 parseArg :: A.FromJSON r => Text -> A.Value -> Either RpcError r
-parseArg name val = case A.fromJSON val of
-                      A.Error msg -> throwError $ argTypeError msg
-                      A.Success x -> return x
+parseArg name val = case iparse A.parseJSON val of
+                      IError path msg -> throwError $ argTypeError (formatError path msg)
+                      ISuccess x -> return x
     where argTypeError = rpcErrorWithData (-32602) $ "Wrong type for argument: " `append` name
 
 paramDefault :: Parameter a -> Either RpcError a
