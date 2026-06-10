@@ -20,6 +20,9 @@ module Network.JsonRpc.Server (
                            , toMethod
                            , call
                            , callWithBatchStrategy
+                           , callWithInstrument
+                           , callWithBatchStrategyAndInstrument
+                           , Instrument
                            , Parameter(..)
                            , (:+:) (..)
                            , MethodParams
@@ -89,6 +92,13 @@ toMethods = id
 
 type MethodMap m = KM.KeyMap (Method m)
 
+-- | An instrumentation hook applied around each method invocation, given the
+--   method name. It lets callers observe per-method timing and outcome
+--   (including for each element of a batch) without coupling this library to
+--   any metrics backend. The default entry points ('call',
+--   'callWithBatchStrategy') use the identity instrument and so are unchanged.
+type Instrument m = Text -> RpcResult m A.Value -> RpcResult m A.Value
+
 -- | Handles one JSON-RPC request. It is the same as
 --   @callWithBatchStrategy sequence@.
 call :: Monad m => [Method m]  -- ^ Choice of methods to call.
@@ -97,6 +107,14 @@ call :: Monad m => [Method m]  -- ^ Choice of methods to call.
                                --   'Nothing' in the case of a notification,
                                --   all wrapped in the given monad.
 call = callWithBatchStrategy sequence
+
+-- | Like 'call', but applies the given 'Instrument' around every method
+--   invocation. It is the same as @callWithBatchStrategyAndInstrument sequence@.
+callWithInstrument :: Monad m => Instrument m  -- ^ Hook wrapped around each method call.
+                   -> [Method m]               -- ^ Choice of methods to call.
+                   -> B.ByteString             -- ^ JSON-RPC request.
+                   -> m (Maybe B.ByteString)   -- ^ The response, as in 'call'.
+callWithInstrument = callWithBatchStrategyAndInstrument sequence
 
 -- | Handles one JSON-RPC request. The method names must be unique.
 callWithBatchStrategy :: Monad m =>
@@ -107,7 +125,23 @@ callWithBatchStrategy :: Monad m =>
                       -> m (Maybe B.ByteString)                  -- ^ The response wrapped in 'Just', or
                                                                  --   'Nothing' in the case of a notification,
                                                                  --   all wrapped in the given monad.
-callWithBatchStrategy strategy methods =
+callWithBatchStrategy strategy = callWithBatchStrategyAndInstrument strategy noInstrument
+    where noInstrument _ result = result
+
+-- | The most general entry point: handles one JSON-RPC request with both a
+--   batch evaluation strategy and an 'Instrument' applied around each method
+--   call. 'call', 'callWithInstrument', and 'callWithBatchStrategy' are all
+--   special cases of this function.
+callWithBatchStrategyAndInstrument :: Monad m =>
+                         (forall a . NFData a => [m a] -> m [a]) -- ^ Function specifying the
+                                                                 --   evaluation strategy.
+                      -> Instrument m                            -- ^ Hook wrapped around each method call.
+                      -> [Method m]                              -- ^ Choice of methods to call.
+                      -> B.ByteString                            -- ^ JSON-RPC request.
+                      -> m (Maybe B.ByteString)                  -- ^ The response wrapped in 'Just', or
+                                                                 --   'Nothing' in the case of a notification,
+                                                                 --   all wrapped in the given monad.
+callWithBatchStrategyAndInstrument strategy instrument methods =
     mthMap `seq` either returnErr callMethod . parse
   where
     mthMap = KM.fromList $
@@ -123,18 +157,18 @@ callWithBatchStrategy strategy methods =
           _ -> throwInvalidRpc "Not a JSON object or array"
     callMethod rq =
         case rq of
-          Left val -> encodeJust `liftM` singleCall mthMap val
-          Right vals -> encodeJust `liftM` batchCall strategy mthMap vals
+          Left val -> encodeJust `liftM` singleCall instrument mthMap val
+          Right vals -> encodeJust `liftM` batchCall strategy instrument mthMap vals
       where
         encodeJust r = A.encode <$> r
     returnErr = return . Just . A.encode . nullIdResponse
     invalidJson = throwError $ rpcError (-32700) "Invalid JSON"
 
-singleCall :: Monad m => MethodMap m -> A.Value -> m (Maybe Response)
-singleCall methods val = case parsed of
+singleCall :: Monad m => Instrument m -> MethodMap m -> A.Value -> m (Maybe Response)
+singleCall instrument methods val = case parsed of
                                 Left err -> return $ nullIdResponse err
                                 Right (Request name args i) ->
-                                  toResponse i `liftM` runExceptT (applyMethodTo args =<< method)
+                                  toResponse i `liftM` runExceptT (instrument name (applyMethodTo args =<< method))
                                     where method = lookupMethod name methods
     where parsed = runIdentity $ runExceptT $ parseValue val
           applyMethodTo args (Method _ f) = f args
@@ -155,11 +189,12 @@ throwInvalidRpc :: Monad m => Text -> RpcResult m a
 throwInvalidRpc = throwError . rpcErrorWithData (-32600) "Invalid JSON-RPC 2.0 request"
 
 batchCall :: Monad m => (forall a. NFData a => [m a] -> m [a])
+          -> Instrument m
           -> MethodMap m
           -> [A.Value]
           -> m (Maybe [Response])
-batchCall strategy methods vals = (noNull . catMaybes) `liftM` results
-    where results = strategy $ map (singleCall methods) vals
+batchCall strategy instrument methods vals = (noNull . catMaybes) `liftM` results
+    where results = strategy $ map (singleCall instrument methods) vals
           noNull rs = if null rs then Nothing else Just rs
 
 toResponse :: A.ToJSON a => Maybe Id -> Either RpcError a -> Maybe Response
